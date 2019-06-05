@@ -1,0 +1,3 @@
+return_value: uint32;
+INPUT_A_msg: uint32;
+INPUT_B_p: uint32;

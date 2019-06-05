@@ -1,0 +1,4 @@
+return_value: uint8;
+INPUT_A_msg: uint8[16];
+INPUT_B_p: uint8[16];
+OUTPUT_result: uint8;
