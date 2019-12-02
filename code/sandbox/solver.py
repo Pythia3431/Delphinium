@@ -3,7 +3,10 @@ import copy
 import stp
 import subprocess
 import time
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, gettempdir
+
+CMS_SAT = 10
+CMS_UNSAT = 20
 
 class CNF:
     def __init__(self):
@@ -58,7 +61,7 @@ class SolverInterface:
         exact(name) -> count
         atleastx(name, x) -> bool
         cnf() -> cnf object, bitvector-variable map
-        approxmc() -> count
+        approxmc() -> count, time
     """
     def __init__(self):
         """ return new solver """
@@ -213,7 +216,9 @@ class SolverInterface:
             critical = False
             for guess in (0, 1):
                 self.push()
-                self.add(self.extract(_bv,i,i) != self.bvconst(guess,1))
+                self.add(self._not(
+                         self._eq(self.extract(_bv,i,i),
+                                  self.bvconst(guess,1))))
                 if not self.check():
                     critical = True
                     soln[i] = str(guess)
@@ -248,48 +253,31 @@ class SolverInterface:
                                      trials_passed)
         return self._uge(trials_passed, self.bvconst(int(((0.5+delta)*t)), t))
 
-    def approxandtime(self):
-        with NamedTemporaryFile(mode='w+') as f:
-            cnf_start = time.time()
-            cnf_duration = time.time() - cnf_start
-            f.write(write_stream)
-            f.seek(0)
-            try:
-                output = subprocess.check_output(['approxmc', f.name])
-            except subprocess.CalledProcessError as e:
-                if "UNSAT" in e.output:
-                    raise ValueError("Solver must be satisfiable")
-                elif "Number of solutions" in e.output:
-                    sols = e.output[e.output.find("Number of solutions"):]
-                    sols = sols.split(": ")[1].split(" x ")
-                    total = 1
-                    for number in sols:
-                        number = number.strip()
-                        if "^" in number:
-                            sub = number.split("^")
-                            num = int(sub[0])**int(sub[1])
-                        else:
-                            num = int(number)
-                        total *= num
-                    return total, cnf_duration
-                else:
-                    raise e
-
-    def approxmc(self):
+    def approxmc(self, tmpdir=gettempdir(), verbose=False):
         """ approxmc count the current solver """
-        with NamedTemporaryFile(mode='w+') as f:
+        with NamedTemporaryFile(mode='w+', dir=tmpdir) as f:
+            if verbose:
+                print("Generating CNF...")
             cnf_start = time.time()
-            write_stream = str(self.cnf())
+            write_stream = str(self.cnf(addTrue=False))
             cnf_duration = time.time() - cnf_start
+            if verbose:
+                print("CNF generated in {}s".format(cnf_duration))
+                print("Writing CNF to {}".format(f.name))
             f.write(write_stream)
             f.seek(0)
+            if verbose:
+                print("Running ApproxMC...")
             try:
                 output = subprocess.check_output(['approxmc', f.name])
             except subprocess.CalledProcessError as e:
                 if "UNSAT" in e.output:
-                    print(e.output)
+                    with open("approxmc_error", 'w') as g:
+                        g.write(write_stream)
                     raise ValueError("Solver must be satisfiable")
                 elif "Number of solutions" in e.output:
+                    if verbose:
+                        print("Done running ApproxMC")
                     sols = e.output[e.output.find("Number of solutions"):]
                     sols = sols.split(": ")[1].split(" x ")
                     total = 1
@@ -308,13 +296,15 @@ class SolverInterface:
     def cnf(self):
         raise NotImplementedError
 
-    def exact(self, name):
+    def exact(self, name, printModel=False):
         """ exact count the current solver on the named bitvec """
         self.push()
         count = 0
         while self.check():
             count += 1
-            m = self.model([name])[name]
+            m = self.model(name)[name]
+            if printModel:
+                print("Solution {}: {}".format(count, m))
             self.add(self._not(self._eq(self.bv(name),
                                         self.bvconst(m, self.bvlen(name)))))
         self.pop()
@@ -337,8 +327,7 @@ class Z3Solver(SolverInterface):
         self.solver.set("cache_all", True)
         self.bitvecs = {}
         self.knownbitscache = {}
-        self.malleations = []
-        
+
     def unsat_core(self):
         return self.solver.unsat_core()
 
@@ -406,21 +395,6 @@ class Z3Solver(SolverInterface):
         return (bv << i)
 
     def _rshift(self, bv, i):
-        """ Change necessary here because Z3 will not
-            let you shift bitvectors by bvs of differing lengths
-            this is a hack
-        """
-        if isinstance(i, z3.BitVecRef):
-            len_i = i.size()
-            len_bv = bv.size()
-            if len_i > len_bv: 
-                raise ValueError("No support right now for logical shifts by bit vectors greater than the original bv length. :(")
-                ext_bv = z3.ZeroExt(len_i - len_bv, bv)
-            elif len_bv > len_i:
-                ext_i = z3.ZeroExt(len_bv - len_i, i)
-                return z3.LShR(bv, ext_i)
-            else:
-                return z3.LShR(bv,i)
         return z3.LShR(bv, i)
 
     def _mult(self, bv1, bv2):
@@ -453,6 +427,9 @@ class Z3Solver(SolverInterface):
     def assertions(self):
         return self.solver.assertions()
 
+    def generate_debug_SMTLIB2(self):
+        return self.solver.to_smt2()
+        
     def model(self, *names):
         m = self.solver.model()
         result = {}
@@ -466,62 +443,33 @@ class Z3Solver(SolverInterface):
     def cnf(self, addTrue=True):
         goal = z3.Goal()
         goal.add(self.solver.assertions())
-        tactic = z3.Then('simplify', 'bit-blast', 'tseitin-cnf')
+        tactic = z3.Then('simplify', 'propagate-values', 'bit-blast', 'tseitin-cnf')
         subgoal = tactic(goal)
         cnf = CNF()
-        for clause in subgoal[0]: # each clause is ANDed together
-            cnf_clause = []
-            if not clause.children():
-                # clause is a bare variable
-                if str(clause) in cnf.variables:
-                    v = cnf.variables[str(clause)]
-                else:
-                    v = cnf.newvar()
-                    cnf.variables[str(clause)] = v
-                cnf_clause.append(v)
-            else:
-                # clause is an OR or a NOT
-                if clause.decl().name() == 'or':
-                    for subclause in clause.children():
-                        if subclause.decl().name() == "not":
-                            # negated variable
-                            negated = subclause.children()
-                            if len(negated) != 1:
-                                raise ValueError("Malformed NOT in CNF")
-                            if str(negated[0]) in cnf.variables:
-                                v = cnf.variables[str(negated[0])]
-                            else:
-                                v = cnf.newvar()
-                                cnf.variables[str(negated[0])] = v
-                            cnf_clause.append("-{}".format(v))
-                        else:
-                            # variable
-                            if subclause.children():
-                                raise ValueError("Expected variable, got {}".format(subclause.decl().name()))
-                            if str(subclause) in cnf.variables:
-                                v = cnf.variables[str(subclause)]
-                            else:
-                                v = cnf.newvar()
-                                cnf.variables[str(subclause)] = v
-                            cnf_clause.append(v)
-                elif clause.decl().name() == 'not':
-                    negated = clause.children()
-                    if len(negated) != 1:
-                        raise ValueError("Malformed NOT in CNF")
-                    if str(negated[0]) in cnf.variables:
-                        v = cnf.variables[str(negated[0])]
-                    else:
-                        v = cnf.newvar()
-                        cnf.variables[str(negated[0])] = v
-                    cnf_clause.append("-{}".format(v))
-                else:
-                    raise ValueError("Expected NOT, got {}".format(clause.decl().name()))
-            if cnf_clause: # if we somehow had an empty OR or empty NOT, skip
-                cnf.clauses.append(cnf_clause)
+        # Convert tseitin-cnf to cnf file string, internally in z3
+        dimacs_str = subgoal[0].dimacs()
+        # Use the CNF file to fill out the CNF object
+        write_to_dict = dimacs_str.split('\n')
+        number_vars = -1
+        for line in write_to_dict:
+            if line !=  "":
+               if line.startswith("c"):
+                   _, cnf_var, z3_var = line.split(" ") 
+                   cnf.variables[z3_var] = cnf_var
+               elif not line.startswith("p"):
+                   clause = line.split(" ")  
+                   cnf.clauses.append(clause[:-1])
+               elif line.startswith("p"):
+                    header_line = line.split(" ")
+                    number_vars = int(header_line[2])
         if addTrue:
-            true = cnf.newvar()
-            cnf.variables["true"] = true
-            cnf.clauses.append([true])
+            true = number_vars + 1
+            number_vars += 1
+            cnf.variables["true"] = str(true)
+            cnf.clauses.append([str(true)])
+        # needs to be one greater because vars is one ahead of the current number of variables 
+        cnf.var = number_vars + 1
+
         return cnf
 
     def extract(self, bv, high, low):
@@ -541,7 +489,6 @@ class STPSolver(SolverInterface):
             print("Solver not using cryptominisat")
         self.bitvecs = {}
         self.knownbitscache = {}
-        self.malleations = []
 
     def check(self):
         return self.solver.check()

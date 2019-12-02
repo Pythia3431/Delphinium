@@ -10,17 +10,18 @@ import argparse
 import importlib
 import subprocess
 import multiprocessing as mp
+import struct
 from datetime import datetime
 from tempfile import NamedTemporaryFile
 
 import oracle
 import solver as libSolver
+# changes based on which malformations are being used
+from malformations import xor_and_trunc_valid, xor_trunc_per_msg
 import malformations
-from malformations import CBCMallIsValid as malleationIsValid
 format = None
 
 DOPRINT = True
-
 DATE = '-'.join(
     [str(datetime.now().year),
      str(datetime.now().month),
@@ -28,10 +29,10 @@ DATE = '-'.join(
 
 TESTNAME= None
 LOGNAME = None
+CONSTRAINT_GROWTH = None
 GNU_LOG = None # file used to create graphs -- contains all model counting results
 BOOTSTRAP = None
 MULT_OUTPUT = True
-
 
 CMS_SAT = 10
 CMS_UNSAT = 20
@@ -50,6 +51,17 @@ K = None
 TRIALS = None
 DELTA = None
 
+
+
+def write_debug_to_file(query, cnf_clause, cnf_var, z3_check, cms_check, final_bits, query_run):
+    line_to_write = " ".join([str(query), str(cnf_clause), str(cnf_var),str(z3_check), str(cms_check), str(final_bits), str(query_run)])
+    with open(CONSTRAINT_GROWTH, "a") as write_f:
+        write_f.write(line_to_write + "\n")
+
+def write_debug_header():
+    with open(CONSTRAINT_GROWTH, "w") as write_f:
+        write_f.write("Query Number | Number of CNF clauses | Number of CNF vars | Z3 add iterative constraint time | CMS-Experiment time | Known Bits Query Time\n")
+
 def MakeStructuralConstraint(solver, m1_arr, m2_arr,
                              fmt, *p):
     """ Add initial constraints to set up the attack
@@ -61,13 +73,13 @@ def MakeStructuralConstraint(solver, m1_arr, m2_arr,
         solver.add(
             fmt(m1_arr[t], solver),
             fmt(m2_arr[t], solver),
-            ORACLE.do_query_smt(m1_arr[t], solver, *p),
-            solver._not(
-                ORACLE.do_query_smt(m2_arr[t], solver, *p)
+            solver._eq(ORACLE.do_query_smt(m1_arr[t], solver, *p), solver.true()),
+            solver._eq(
+                ORACLE.do_query_smt(m2_arr[t], solver, *p), solver.false()
             ),
         )
 
-def MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, fmt, *p):
+def MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, fmt, *p): #time_var, valid_time, state, *p):
     """ Same as previous MakeStructuralConstraint except works for
         one specific format function's definition of true and false
         we could specify what true and false mean in the actual format
@@ -75,20 +87,46 @@ def MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, fmt, *p):
     """
     
     for i in range(TRIALS):
+        # change 1 -> solver.true()
+        # change 0 -> solver.false()
+        # remove valid_time and time_var from format function and oracle query respectively
+        # get rid of the valid gcm function
         solver.add(
-            malleationIsValid(m1_arr[i], solver, *p),
-            malleationIsValid(m2_arr[i], solver, *p),
-            solver._eq(fmt(m1_arr[i], solver), 1),
-            solver._eq(fmt(m2_arr[i], solver), 1),
-            solver._eq(ORACLE.do_query_smt(m1_arr[i], solver, *p), 1),
-            solver._eq(ORACLE.do_query_smt(m2_arr[i], solver, *p), 0),
+            solver._eq(fmt(m1_arr[i], solver), solver.true()), #, valid_time, state),1),
+            solver._eq(fmt(m2_arr[i], solver), solver.true()), #, valid_time, state),1),
+            solver._eq(ORACLE.do_query_smt(m1_arr[i], solver, *p), solver.true()), #time_var, *p), 1),
+            solver._eq(ORACLE.do_query_smt(m2_arr[i], solver, *p), solver.false()), #time_var, *p),0)
+            xor_trunc_per_msg(solver, m1_arr[i], *p),
+            xor_trunc_per_msg(solver, m2_arr[i], *p)
         )
+    #solver.add(gcm_mallValid(solver, *p))
+    solver.add(xor_and_trunc_valid(solver, *p)) 
+
 
 def AddAttackerKnowledge(final_solver, iterative_solver, m1_arr, m2_arr, fm, realM):
     """ Add extra constraints corresponding to knowledge an attacker would
         have about the real message, this is format and malleation dependent
     """
-    realMsgLength = realM & ((1 << format.length_field_size) - 1)
+    try:
+        print("Trying to add attacker knowledge...") 
+        realMsgLength = realM & ((1 << format.length_field_size) - 1)
+        print("Length of the message is {}".format(realMsgLength))
+        if not final_solver is None:
+            final_solver.add(
+                final_solver._eq(final_solver.extract(fm, format.length_field_size-1, 0), realMsgLength)
+            )
+        for i in range(TRIALS):
+            iterative_solver.add(
+                iterative_solver._eq(iterative_solver.extract(m1_arr[i], format.length_field_size-1,0), realMsgLength)
+            )
+            iterative_solver.add(
+                iterative_solver._eq(iterative_solver.extract(m2_arr[i], format.length_field_size-1,0), realMsgLength)
+            )
+    except:
+        print("Exception occurred in AddAttackerKnowledge")
+        return
+    """
+    # CBC MODE SPECIFIC    
     number_blocks = realMsgLength // format.test_length
     realMsgIV = (realM >> ((number_blocks-1)*format.test_length + format.length_field_size))
     if not final_solver is None:
@@ -96,16 +134,16 @@ def AddAttackerKnowledge(final_solver, iterative_solver, m1_arr, m2_arr, fm, rea
         final_solver.add(final_solver._eq(final_solver.extract(fm, bit_vec_length-1, (number_blocks - 1) * format.test_length + format.length_field_size), realMsgIV))
     for i in range(TRIALS):
         iterative_solver.add(
-            iterative_solver._eq(iterative_solver.extract(m1_arr[i], format.length_field_size-1,0), realMsgLength),
             iterative_solver._eq(iterative_solver.extract(m1_arr[i], bit_vec_length-1, (number_blocks-1)*format.test_length + format.length_field_size), realMsgIV),
         )
         iterative_solver.add(
-            iterative_solver._eq(iterative_solver.extract(m2_arr[i], format.length_field_size-1,0), realMsgLength),
             iterative_solver._eq(iterative_solver.extract(m2_arr[i], bit_vec_length-1, (number_blocks-1)*format.test_length + format.length_field_size), realMsgIV),
+   
         )
-
-def AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
-                                           result, malleation, save=False):
+    """
+    
+def AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr, 
+       result, malleation, save=False):
     """ Step forward in the adaptive attack by inputting the malleation
         and the corresponding oracle result
     """
@@ -138,7 +176,10 @@ def AddIterativeConstraint_CNFSolver(cnfS, cnf, m1c_arr, m2c_arr,
                 ORACLE.do_query_smt_realMall(m2c_arr[i], cnfS, *malleation), add_res
             ),
         )
+    print("Making a new cnf....")
+    start_t = time.time()
     new_cnf = cnfS.cnf(addTrue=False)
+    print("Time to convert cnfS to cnf file {}".format(time.time() - start_t))
     cnfS.pop()
     # convert new_cnf to use variables from old cnf in order to extend old cnf
     new_cnf_map_inv = {}
@@ -162,7 +203,7 @@ def AddIterativeConstraint_CNFSolver(cnfS, cnf, m1c_arr, m2c_arr,
                         v = cnf.newvar()
                     cnf.variables[v] = v # intentional dead mapping, inverting is no-op
                     new_vars[inv_mapped] = v # save in case we see this intermediate again
-            elif inv_mapped.startswith("p") or inv_mapped.startswith("m") or inv_mapped == "true":
+            elif inv_mapped.startswith("p") or inv_mapped.startswith("m") or inv_mapped == "true" or inv_mapped.startswith("v"):
                 v = cnf.variables[inv_mapped]
             else:
                 raise Exception("Invalid variable mapping lookup: {}".format(inv_mapped))
@@ -278,6 +319,7 @@ def GetSizeResultCMS(q, cnf, size, unknown_positions):
              time   : the runtime of CMS on this instance
             )
     """
+    # Change Malleation Recovery to also recover the time 
     xor_indices, coins, seed = SingleSizeExperimentXors(size, unknown_positions)
     procspersolver = max(int(NPROCS/WINDOW_SIZE), 1)
     for m in range(2): # m1 or m2
@@ -292,28 +334,40 @@ def GetSizeResultCMS(q, cnf, size, unknown_positions):
     t0 = time.time()
     with NamedTemporaryFile(mode="w+") as out:
         with NamedTemporaryFile(mode="w+") as f:
-            f.write(str(cnf))
+            cnf_to_file = str(cnf)
+            f.write(cnf_to_file)
             cnf.xors = []
             f.seek(0)
             ret = subprocess.call(["cryptominisat5",
-                                   "--maxnummatrixes", "100",
-                                   "--maxxorsize", "8",
                                    "--verb", "0", "-t", str(procspersolver),
                                    f.name], stdout=out)
             if ret not in [CMS_SAT, CMS_UNSAT]:
                 f.seek(0)
-                subprocess.call(["cp", f.name, "cms_error_{}.cnf".format(ret)])
+                subprocess.call(["cp", f.name, "new_cms_error_{}.cnf".format(ret)])
                 raise Exception("CMS returned bad status {}".format(ret))
         out.seek(0)
         dimacs = out.readlines()
     if ret == CMS_SAT:
         targ_map = ExtractModel(dimacs)
-        mall = RecoverMalleation([('p', format.max_msg_size), ('p_trunc', 2*format.length_field_size)], targ_map, cnf)
+        #mall = RecoverMalleation([('v', format.TIME_FIELD*8), ('p', format.length_field_size + format.bit_vec_length)], targ_map, cnf)
+        mall = RecoverMalleation([('p', format.bit_vec_length + (2*format.length_field_size))], targ_map, cnf)
     elif ret == CMS_UNSAT:
         mall = None
     else:
         raise Exception("CMS returned bad status {}".format(ret))
     q.put((size, mall, time.time()-t0))
+
+def logZ3Time(assertions):
+    test_time = libSolver.Z3Solver()
+    test_time.add(assertions)
+    start_time = time.time()
+    res = test_time.check()
+    time_duration = time.time() - start_time
+    if not res:
+        raise ValueError("Implemented incorrectly")
+    else:
+       with open("debugZ3CMSBridge.log", "a") as write_f:
+           write_f.write("{}\n".format(time_duration))
 
 def PopulateSizeResultsCMS(solver, cnf, curr_size,
                            m1_arr, m2_arr, realM, unknown_positions):
@@ -337,6 +391,7 @@ def PopulateSizeResultsCMS(solver, cnf, curr_size,
     if DOPRINT:
         print("Running CMS window {}...{}".format(curr_size, max(curr_size-WINDOW_SIZE+1, 0)))
     done = False
+    
     while not done and curr_size-WINDOW_SIZE*w > -1:
         procs = []
         for i in range(curr_size-WINDOW_SIZE*w,
@@ -392,13 +447,31 @@ def CreateBoolMapping(solver, m1_arr, m2_arr, auxiliary):
             )
 
 def Trial(bootstrap=None, log=None, prevcnf=""):
+    # reinstantiate time vectors and change makestructuralconstraint
+    # add constraints so the attack would actually be carried out in a reasonable amount of time
+    # change the auxiliary information that gets printed
+    write_debug_header()
     global ORACLE
     if bootstrap is None:
         realM = format.makePaddedMessage()
+        #msg_size = realM & ((1 << format.length_field_size)-1)
+        realM = format.makePaddedMessage()
+        #state_obj
+        #ORACLE.initialize_state(state_obj) 
+        #check_against = time.time() * 10**9
         if not format.checkFormat(realM):
+            #if not format.checkFormat(realM, check_against, state_obj):
             raise ValueError("makePaddedMessage created an invalid message")
     else:
-        realM = None # will get from bootstrap file
+        with open(bootstrap, "r") as read_f:
+            firstline = read_f.readlines()[0]
+            realM = int(firstline.split(" ")[6])
+            #state_obj, ticket_time = format.initialize_state_from_ticket(realM)
+            #ORACLE.initialize_state(state_obj)
+            # add a few seconds to simulate a valid time
+            #check_against = ticket_time + (4 * 10**9)
+           # we're going to assume that any new attacks you are going to do at this time are going to be recently after you run the attack algorithm starting from now
+
     overall_start = time.time()
     # Setup solvers
     #procspersolver = int(NPROCS / WINDOW_SIZE)
@@ -415,33 +488,54 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
         m2_arr.append(solver.bv('m2_' + str(t), bit_vec_length))
         m1c_arr.append(cnfS.bv('m1_' + str(t), bit_vec_length))
         m2c_arr.append(cnfS.bv('m2_' + str(t), bit_vec_length))
-    p = solver.bv('p', format.max_msg_size); pC = cnfS.bv('p', format.max_msg_size)
-    p_trunc = solver.bv('p_trunc', 2*format.length_field_size); pC_trunc = cnfS.bv('p_trunc',2*format.length_field_size)
+    # how long the malleation is also changes based on the malleation function
+    p = solver.bv('p', format.bit_vec_length + (2*format.length_field_size));
+    pC = cnfS.bv('p', format.bit_vec_length + (2*format.length_field_size))
+    #time_var = solver.bv("v", format.TIME_FIELD * 8); time_var_c = cnfS.bv("v", format.TIME_FIELD * 8)
     fm = finalS.bv('fm', bit_vec_length)
-    
-    MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, format.checkFormatSMT, p, p_trunc)
-    MakeStructuralConstraintMultiOutput(cnfS, m1c_arr, m2c_arr, format.checkFormatSMT, pC, pC_trunc)
+    MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, format.checkFormatSMT, p)#time_var, check_against, state_obj, p)
+    MakeStructuralConstraintMultiOutput(cnfS, m1c_arr, m2c_arr, format.checkFormatSMT, pC)#time_var, check_against, state_obj, pC)
+    #time_duration = 60 * 60 * 5 * 10**9 # we want to conduct the attack over a short range of time
+    #time_must_end = 60 * 60 * 24 * 10**9
+    #const_now_time = (time.time()*(10**9))
+    #solver.add(solver._uge(time_var, time_duration + const_now_time))
+    #cnfS.add(cnfS._uge(time_var_c, time_duration + const_now_time))
+    #solver.add(solver._ule(time_var, time_must_end + const_now_time))
+    #cnfS.add(cnfS._ule(time_var_c, time_must_end + const_now_time))
+
     AddAttackerKnowledge(finalS, solver, m1_arr, m2_arr, fm, realM)
     AddAttackerKnowledge(None, cnfS, m1c_arr, m2c_arr, None, realM)
-    CreateBoolMapping(solver, m1_arr, m2_arr, [("p", p), ("p_trunc", p_trunc)])
-    CreateBoolMapping(cnfS, m1c_arr, m2c_arr,[("p", pC), ("p_trunc", pC_trunc)])
-    
-    finalS.add(finalS._eq(format.checkFormatSMT(fm, finalS),1))
+    CreateBoolMapping(solver, m1_arr, m2_arr, [("p", p)])#, ("v", time_var)])
+    CreateBoolMapping(cnfS, m1c_arr, m2c_arr,[("p", pC)])#, ("v", time_var_c)])
+    #final_time = finalS.bv("time", format.TIME_FIELD * 8)
+    # assuming that the session ticket picked up actually is still "alive"
+    finalS.add(
+        finalS._eq(format.checkFormatSMT(fm, finalS), finalS.true())#check_against, state_obj), 1)
+    )
     queryNum = 0
     if bootstrap is not None:
-        queryNum, realM = bootstrapPrevRun(bootstrap, finalS, fm, solver, m1_arr, m2_arr)
-    InitTrialLogging(realM)
+        print("Bootstrapping previous run....")
+        queryNum, _, _ = bootstrapPrevRun(bootstrap, finalS, fm, solver, m1_arr, m2_arr)
+        startQueryNum = queryNum + 1
+    aux = "" #"State object is {}\n Valid time was {}".format(state_obj, check_against)
+    InitTrialLogging(realM, aux)
     t0 = time.time()
     if prevcnf is "":
         if DOPRINT:
             print("Generating inital CNF...")
+        print("Checking bit_blast")
+        start_t = time.time()
         cnf = solver.cnf()
+        end_duration = time.time() - start_t
+        print("Amount of time it took to simplify and bit blast was {}".format(end_duration))
         out = DATE+"/"+TESTNAME+".cnf"
         if DOPRINT:
             print("Saving structural constraint CNF to file: {}".format(out))
         with open(out, 'w') as f:
             f.write("c map {}\n".format(json.dumps(cnf.variables)))
-            f.write(str(cnf))
+            in_mem = str(cnf)
+            print("Size in bytes is {}".format(len(in_mem)))
+            f.write(in_mem)
     else:
         if DOPRINT:
             print("Parsing previous CNF file {}...".format(prevcnf))
@@ -449,89 +543,105 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
     if DOPRINT:
         print("Done ({}s)".format(time.time()-t0))
     curr_size = bit_vec_length
+
     unknown_positions = {i for i in range(bit_vec_length)}
     sol_vect = ['?' for _ in range(bit_vec_length)]
     while solver.check() and '?' in sol_vect:
+        print("Time at start of query {} is {}".format(queryNum, time.time()))
         if DOPRINT:
             print "Starting query #", queryNum
         queryNum += 1
-        t0 = time.time()
-        if DOPRINT:
-            print("Determining known bits...")
-        sol_vect = finalS.knownbits("fm")
- 
-        if DOPRINT:
-            print("Done ({}s)".format(time.time()-t0))
-        if sol_vect.count('?') < curr_size: # did we learn some bits?
-            curr_size = sol_vect.count('?')
-            global K
-            K = int(math.floor(math.log(curr_size, 2)))
-            # the upper bound on how big the size of the set can be
-            # is 2**(bit_vec_length - # of bits known)
-            removed = set()
-            for i, val in enumerate(sol_vect):
-                if val != "?" and i in unknown_positions:
-                    unknown_positions.remove(i)
-                    removed.add(i)
-            if DOPRINT:
-                print("Removing indices {} from consideration".format(
-                    sorted(list(removed)))
-                )
-            if curr_size == 0:
-                break
-            # compact iterative constraints back into the solver
+        # only going to conduct known bits every 10 queries to save time -- this is call is getting expensive (/approx 600 sec = 10 min)
+        discovered_bits = False
+        known_bits_call = -1
+        if queryNum % 7 == 1 or (bootstrap is not None and queryNum == startQueryNum):
             t0 = time.time()
+            
             if DOPRINT:
-                print("Condensing CNF...")
-            while solver.malleations:
-                res, mall = solver.malleations.pop()
-                AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
-                                                       res, mall, save=False)
+                print("Determining known bits...")
+            sol_vect = finalS.knownbits("fm")
+            msg_check = list(bin(realM)[2:].zfill(format.bit_vec_length))
+            msg_check.reverse() 
+            print("Checking to make sure no wrong bits were learned...")
+            for i in range(len(sol_vect)):
+                if sol_vect[i] != msg_check[i] and sol_vect[i] != "?":
+                    raise ValueError("Learned a wrong bit")
+            print("Finished check")
+            known_bits_call = time.time() - t0
             if DOPRINT:
-                print("Done ({}s)".format(time.time()-t0))
+                print("Finished known bits query on final message ({}s)".format(known_bits_call))
+            CNF_extract_time = -1
+            if sol_vect.count('?') < curr_size: # did we learn some bits?
+                discovered_bits = True
+                curr_size = sol_vect.count('?')
+                global K
+                K = int(math.floor(math.log(curr_size, 2)))
+                # the upper bound on how big the size of the set can be
+                # is 2**(bit_vec_length - # of bits known)
+                removed = set()
+                for i, val in enumerate(sol_vect):
+                    if val != "?" and i in unknown_positions:
+                        unknown_positions.remove(i)
+                        removed.add(i)
+                if DOPRINT:
+                    print("Removing indices {} from consideration".format(
+                        sorted(list(removed)))
+                    )
+                if curr_size == 0:
+                    break
+        else:
+            known_bits_call = -1
+        # compact iterative constraints back into the solver
+        if discovered_bits or queryNum % 10 == 0:
             t0 = time.time()
             if DOPRINT:
                 print("Re-extracting CNF")
+            
             # re-extract CNF now encoding all iterative constraints thus far
+            CNF_extract_time = time.time()
             cnf = solver.cnf()
+            CNF_extract_time = time.time() - CNF_extract_time
+
             if DOPRINT:
-                print("Done ({}s)".format(time.time()-t0))
+                print("Time to convert solver to cnf ({}s)".format(time.time()-t0))
         if DOPRINT:
             print "Solver knows ({} bits): {}".format(
                     bit_vec_length-curr_size, ''.join(list(reversed(sol_vect)))
             )
+        CNF_clause = len(cnf.clauses)
+        CNF_var = len(cnf.variables)
         t0 = time.time()
         size_results = PopulateSizeResults(solver, cnf, curr_size,
                                                 m1_arr, m2_arr,
                                                 realM, unknown_positions)
         if DOPRINT:
-            print("Done ({}s)".format(time.time()-t0))
+            print("Running CMS in parallel ({}s)".format(time.time()-t0))
             print("Processing CMS results...") 
         t1 = time.time()
-        ProcessSizeResults(size_results, finalS, solver, cnfS, cnf,
+        total_time, iterative_time = ProcessSizeResults(size_results, finalS, solver, cnfS, cnf,
                            fm, m1_arr, m2_arr, m1c_arr, m2c_arr, realM)
         if DOPRINT:
-            print("Done ({}s)".format(time.time()-t1))
-        size_results = []
+            print("Finished processing size results ({}s)".format(time.time()-t1))
         elap = time.time() - t0
+        write_debug_to_file(queryNum, CNF_clause, CNF_var, iterative_time, total_time, known_bits_call, elap) 
+        size_results = []
         if DOPRINT:
             print "Elapsed: {}s in query {}".format(elap, queryNum)
-            print "Elapsed: {}s so far".format(time.time() - overall_start)
+            print "Elapsed: {}s so far".format(time.time() - overall_start) 
+        print("Time at end of query {} is {}".format(queryNum-1, time.time()))
     if DOPRINT:
         print "Fell through at current size {}".format(curr_size)
 
     cardinality_satisfied = 0
     sawGood = False
-    while finalS.check():
-        finalResult = finalS.model('fm')['fm']
-        if DOPRINT:
-            print "Solution %d for M: " % cardinality_satisfied, "\t", finalResult
-        if (finalResult == realM):
-            if DOPRINT:
-                print "Saw the correct solution"
-            sawGood = True
-        finalS.add(fm != finalResult)
-        cardinality_satisfied += 1
+    # check to see if the final message is in the model and then do a model count
+    finalS.push()
+
+    finalS.add(finalS._eq(fm, realM))
+    if finalS.check():
+        sawGood = True
+    finalS.pop()
+    cardinality_satisfied, _ = finalS.approxmc()
     return {'sawGood': sawGood,
             'cardinality': cardinality_satisfied,
             'queries': queryNum,
@@ -563,11 +673,14 @@ def ProcessSizeResults(size_results, finalS, solver, cnfS, cnf, fm,
         if size_results[i] is not None and None not in size_results[i][0]:
             mall, _ = size_results[i]
             # first argument is actually time
-            res = ORACLE.do_query(realM, mall[0], mall[1])
+            #res = ORACLE.do_query(realM, mall[0], mall[1])
+            # malleation first, time is second
+            res = ORACLE.do_query(realM, *mall)
             actual_size_mbound = i
             if DOPRINT:
                 print("Success at size {} (oracle: {})".format(i, res))
             break
+    iterative_time = -1
     if res is not None:
         t0 = time.time()
         if DOPRINT:
@@ -576,8 +689,9 @@ def ProcessSizeResults(size_results, finalS, solver, cnfS, cnf, fm,
                                                res, mall)
         AddIterativeConstraint_CNFSolver(cnfS, cnf, m1c_arr, m2c_arr, res, mall)
         AddIterativeConstraint_FinalSolver(finalS, fm, res, mall)
+        iterative_time = time.time()-t0
         if DOPRINT:
-            print("Done ({}s)".format(time.time()-t0))
+            print("Time to add iterative constraints ({}s)".format(time.time()-t0))
         with open(GNU_LOG, "a") as log_w:
             log_w.write("{} {}\n".format(actual_size_mbound, total_time))
         with open(LOGNAME, "a") as log_w:
@@ -587,8 +701,9 @@ def ProcessSizeResults(size_results, finalS, solver, cnfS, cnf, fm,
             print("No MBound-satisfiable malleations found")
         with open(GNU_LOG, "a") as log_w:
             log_w.write("{} {}\n".format(None, total_time))
+    return (total_time, iterative_time)
 
-def InitTrialLogging(realM):
+def InitTrialLogging(realM, extra=None):
     """ Write initial information to the first lines of the log files """
     if DOPRINT:
         print "Real Message: {}".format(bin(realM))
@@ -598,20 +713,24 @@ def InitTrialLogging(realM):
         format_header = "Full run of attack with message {} at {} Bit with trials {}, delta {}, and k is {}. Threshold for success is {}/{}\n".format(realM, format.test_length, TRIALS, DELTA, K, math.floor((DELTA + 0.5) * TRIALS), TRIALS)
     with open(GNU_LOG, "w") as dat_write:
         dat_write.write(format_header)
-        dat_write.write("MBound size (log2) | Query time (longest in parallel)\n")
+        if extra is not None:
+            dat_write.write(extra)
+        dat_write.write("MBound size (log2) | Query time (longest in parallel)\n")        
     with open(LOGNAME, "w") as write_log:
         write_log.write(format_header)
 
 def main():
-    global TESTNAME, LOGNAME, GNU_LOG, BOOTSTRAP, ORACLE, bit_vec_length, format
+    # Change the oracle from Time -> Malleation and change the plethora of malformation functions
+    global TESTNAME, LOGNAME, CONSTRAINT_GROWTH, GNU_LOG, BOOTSTRAP, ORACLE, bit_vec_length, format
     try:
         TESTNAME = os.environ["NAME"]
     except KeyError as e:
         print "Must provide NAME in environment for log file name"
         raise e
     BOOTSTRAP = os.environ.get("PREV")
-    LOGNAME = DATE+"/"+TESTNAME
+    LOGNAME = DATE+"/"+TESTNAME 
     GNU_LOG = DATE+"/"+TESTNAME
+    CONSTRAINT_GROWTH = DATE + "/" + TESTNAME
     if not os.path.exists(DATE):
         os.mkdir(DATE)
     ext = 0
@@ -621,6 +740,7 @@ def main():
         ext += 1
     LOGNAME = DATE+"/"+TESTNAME+('_'+str(ext) if ext > 0 else '')+".log"
     GNU_LOG = DATE+"/"+TESTNAME+('_'+str(ext) if ext > 0 else '')+".dat"
+    CONSTRAINT_GROWTH = DATE+"/"+TESTNAME+('_'+str(ext) if ext > 0 else '')+"constraint_size.log"
     if DOPRINT:
         print("Logging to {}".format(LOGNAME))
         print("Writing MBound results to {}".format(GNU_LOG))
@@ -644,8 +764,7 @@ def main():
             bit_vec_length = format.bit_vec_length
         except AttributeError:
             bit_vec_length = format.test_length
-
-    ORACLE = oracle.MalleationOracle(format.checkFormat, format.checkFormatSMT, malformations.CBC_MODE, malformations.CBC_MODE_symb_msg, malformations.CBC_MODE_symb_mall_msg)
+    ORACLE = oracle.MalleationOracle(format.checkFormat, format.checkFormatSMT, malformations.XOR_AND_TRUNC_MALLS[0], malformations.XOR_AND_TRUNC_MALLS[1], malformations.XOR_AND_TRUNC_MALLS[2])
     WINDOW_SIZE = args["window"]
     NPROCS = args["procs"]
     ISRANDOM = args["random"]
@@ -699,28 +818,27 @@ def bootstrapPrevRun(filename, finalS, fm, solver, m1_arr, m2_arr):
         print("Bootstrapping from {} ({} queries)".format(filename, len(lines)-1))
     try:
         realM = int((lines[0].split(" "))[6])
+        state_obj = format.initialize_state_from_ticket(realM)
     except Exception as e:
         print("Malformed bootstrap file")
         raise e
     queryNum = 0
     for line in lines[1:]:
-        tokens = line.split(" ")
+        tokens = line.split("] ")
         if len(tokens) != 2: # malleation integer and oracle result
             continue
         try:
-            mall = json.loads(tokens[0])
-            res = True if tokens[1].strip() == "True" else False
+            mall = json.loads(tokens[0] + "]")
+            res = int(tokens[1].strip())
         except ValueError as e:
             print("Malformed bootstrap file")
             raise e
-        # NOTE only taking "True" oracle queries from log file
-        # This represents a hack which makes PKCS7 (and possibly many formats)
-        # much faster to bootstrap at minimal loss
-        if res:
-            queryNum += 1
-            AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
+        queryNum += 1
+        AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
                                                    res, mall)
-    return queryNum, realM
+        AddIterativeConstraint_FinalSolver(finalS, fm, res, mall)
+    return queryNum, realM, state_obj
+    #return queryNum, realM
 
 if __name__ == "__main__":
     exit(main())

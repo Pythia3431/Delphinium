@@ -129,7 +129,7 @@ def main():
         print("Message must not be none. Program exiting...")
         sys.exit(1)
     # add constraint to final solver
-    finalS.add(finalS._eq(format.checkFormatSMT(fm, finalS), 1))
+    finalS.add(format.checkFormatSMT(fm, finalS))
     pkcs7attack(realMessage, fm, finalS)
     return 
 

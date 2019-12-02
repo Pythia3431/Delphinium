@@ -11,47 +11,16 @@ import importlib
 import subprocess
 import multiprocessing as mp
 from datetime import datetime
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, gettempdir
 
 import oracle
 import solver as libSolver
 from malformations import xor as malform
-import malformations
-format = None
-
-DOPRINT = True
 
 DATE = '-'.join(
     [str(datetime.now().year),
      str(datetime.now().month),
      str(datetime.now().day)])
-
-TESTNAME= None
-LOGNAME = None
-GNU_LOG = None # file used to create graphs -- contains all model counting results
-BOOTSTRAP = None
-
-CMS_SAT = 10
-CMS_UNSAT = 20
-
-# total size of bit vectors in bits
-bit_vec_length = None
-ORACLE = None
-
-try:
-    malleationIsValid = malformations.CBCMallIsValid
-except AttributeError:
-    malleationIsValid = all_pass
-
-
-WINDOW_SIZE = None # sliding window for parallelization
-NPROCS = None # mp.cpu_count()
-# setting for size of parity contraints when ISRANDOM is true
-# is based off of https://arxiv.org/pdf/1512.08863v1.pdf        
-ISRANDOM = None
-K = None
-TRIALS = None
-DELTA = None
 
 def MakeStructuralConstraint(solver, m1_arr, m2_arr,
                              fmt, *p):
@@ -70,12 +39,13 @@ def MakeStructuralConstraint(solver, m1_arr, m2_arr,
             ),
         )
 
+"""
 def MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, fmt, *p):
-    """ Same as previous MakeStructuralConstraint except works for
+    ""\" Same as previous MakeStructuralConstraint except works for
         one specific format function's definition of true and false
         we could specify what true and false mean in the actual format
         file
-    """
+    ""\"
     for i in range(TRIALS):
         solver.add(
             solver._eq(fmt(m1_arr[i], solver), 1),
@@ -87,9 +57,9 @@ def MakeStructuralConstraintMultiOutput(solver, m1_arr, m2_arr, fmt, *p):
         )
 
 def AddAttackerKnowledge(final_solver, iterative_solver, m1_arr, m2_arr, fm, realM):
-    """ Add extra constraints corresponding to knowledge an attacker would
+    ""\" Add extra constraints corresponding to knowledge an attacker would
         have about the real message, this is format and malleation dependent
-    """
+    ""\"
     realMsgLength = realM & ((1 << format.length_field_size) - 1)
     final_solver.add(final_solver._eq(final_solver.extract(fm, format.length_field_size - 1, 0), realMsgLength))
     for i in range(TRIALS):
@@ -99,15 +69,14 @@ def AddAttackerKnowledge(final_solver, iterative_solver, m1_arr, m2_arr, fm, rea
         iterative_solver.add(
             iterative_solver._eq(iterative_solver.extract(m2_arr[i], format.length_field_size-1,0), realMsgLength)
         )
+"""
 
 def AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
-                                           result, malleation, save=False):
+                                           result, malleation):
     """ Step forward in the adaptive attack by inputting the malleation
         and the corresponding oracle result
     """
     add_res = solver._bool(result)
-    if save:
-        solver.malleations.append((result, malleation))
     for i in range(TRIALS):
         solver.add(
             solver._iff(
@@ -264,6 +233,8 @@ def GetSizeResultCMS(q, cnf, size, unknown_positions):
              time   : the runtime of CMS on this instance
             )
     """
+    if DELTA != 0.5:
+        raise Exception("FIX T/DELTA")
     xor_indices, coins, seed = SingleSizeExperimentXors(size, unknown_positions)
     procspersolver = max(int(NPROCS/WINDOW_SIZE), 1)
     for m in range(2): # m1 or m2
@@ -276,8 +247,8 @@ def GetSizeResultCMS(q, cnf, size, unknown_positions):
                     xor.append(cnf.variables["true"])
                 cnf.xors.append(xor)
     t0 = time.time()
-    with NamedTemporaryFile(mode="w+") as out:
-        with NamedTemporaryFile(mode="w+") as f:
+    with NamedTemporaryFile(mode="w+", dir=TMPDIR) as out:
+        with NamedTemporaryFile(mode="w+", dir=TMPDIR) as f:
             f.write(str(cnf))
             cnf.xors = []
             f.seek(0)
@@ -286,19 +257,19 @@ def GetSizeResultCMS(q, cnf, size, unknown_positions):
                                    "--maxxorsize", "8",
                                    "--verb", "0", "-t", str(procspersolver),
                                    f.name], stdout=out)
-            if ret not in [CMS_SAT, CMS_UNSAT]:
+            if ret not in [libSolver.CMS_SAT, libSolver.CMS_UNSAT]:
                 f.seek(0)
                 subprocess.call(["cp", f.name, "cms_error_{}.cnf".format(ret)])
                 raise Exception("CMS returned bad status {}".format(ret))
         out.seek(0)
         dimacs = out.readlines()
-    if ret == CMS_SAT:
+    if ret == libSolver.CMS_SAT:
         targ_map = ExtractModel(dimacs)
         mall = long(0)
         for b in range(bit_vec_length):
             targ = cnf.variables["p_{}".format(b)]
             mall |= (targ_map[targ] << b)
-    elif ret == CMS_UNSAT:
+    elif ret == libSolver.CMS_UNSAT:
         mall = None
     else:
         raise Exception("CMS returned bad status {}".format(ret))
@@ -320,16 +291,23 @@ def PopulateSizeResultsCMS(solver, cnf, curr_size,
             UNSAT results have a tuple (None, time)
             Unattempted results have a value None
     """
-    size_results = [None]*curr_size
+    size_results = [None]*(curr_size+1)
     q = mp.Queue()
     w = 0
     if DOPRINT:
         print("Running CMS window {}...{}".format(curr_size, max(curr_size-WINDOW_SIZE+1, 0)))
     done = False
-    while not done and curr_size-WINDOW_SIZE*w > 0:
+    while not done and curr_size-WINDOW_SIZE*w > -1:
         procs = []
-        for i in range(curr_size-WINDOW_SIZE*w,
-                       max(curr_size-WINDOW_SIZE*(w+1), 0), -1):
+        if INVERT:
+            window = range(WINDOW_SIZE*w,
+                           min(WINDOW_SIZE*(w+1), curr_size+1),
+                           1)
+        else:
+            window = range(curr_size-WINDOW_SIZE*w,
+                           max(curr_size-WINDOW_SIZE*(w+1), -1),
+                           -1)
+        for i in window:
             p = mp.Process(target=GetSizeResultCMS,
                            args=(q, cnf, i, unknown_positions)
             )
@@ -341,7 +319,7 @@ def PopulateSizeResultsCMS(solver, cnf, curr_size,
             size, mall, time_run = q.get()
             if mall is not None:
                 done = True
-            size_results[size-1] = ((mall,), time_run)
+            size_results[size] = ((mall,), time_run)
         w += 1
     return size_results
 
@@ -371,8 +349,8 @@ def CreateBoolMapping(solver, m1_arr, m2_arr, p):
         pi = solver.bool("p_{}".format(i))
         solver.add(solver._eq(pi, solver._eq(solver.extract(p, i, i), one)))
 
-def Trial(bootstrap=None, log=None, prevcnf=""):
-    if bootstrap is None:
+def Trial(bootstrap, prevcnf=""):
+    if bootstrap[0] == "":
         realM = format.makePaddedMessage()
         if not format.checkFormat(realM):
             raise ValueError("makePaddedMessage created an invalid message")
@@ -380,11 +358,8 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
         realM = None # will get from bootstrap file
     overall_start = time.time()
     # Setup solvers
-    #procspersolver = int(NPROCS / WINDOW_SIZE)
-    procspersolver = NPROCS
-    assert procspersolver > 0
     libSolver.z3.set_param("parallel.enable", True)
-    libSolver.z3.set_param("parallel.threads.max", procspersolver)
+    libSolver.z3.set_param("parallel.threads.max", NPROCS)
     solver = libSolver.Z3Solver(); cnfS = libSolver.Z3Solver()
     finalS = libSolver.Z3Solver()
     PopulateSizeResults = PopulateSizeResultsCMS
@@ -400,15 +375,22 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
     MakeStructuralConstraint(cnfS, m1c_arr, m2c_arr, format.checkFormatSMT, pC)
     CreateBoolMapping(solver, m1_arr, m2_arr, p)
     CreateBoolMapping(cnfS, m1c_arr, m2c_arr, pC)
-    finalS.add(format.checkFormatSMT(fm, finalS))
+    if REALM_VALID:
+        finalS.add(format.checkFormatSMT(fm, finalS))
     queryNum = 0
-    if bootstrap is not None:
-        queryNum, realM = bootstrapPrevRun(bootstrap, finalS, fm, solver, m1_arr, m2_arr)
+    if bootstrap[0] != "":
+        bootstrap_file = bootstrap[0]
+        approxmc_file = bootstrap[1]
+        queryNum, realM = bootstrapPrevRun(bootstrap_file, finalS, fm,
+                                           solver, m1_arr, m2_arr,
+                                           approxmc_file)
+        if approxmc_file != "":
+            return
     InitTrialLogging(realM)
     t0 = time.time()
-    if prevcnf is "":
+    if prevcnf is "" or bootstrap[0] != "":
         if DOPRINT:
-            print("Generating inital CNF...")
+            print("Generating CNF...")
         cnf = solver.cnf()
         out = DATE+"/"+TESTNAME+".cnf"
         if DOPRINT:
@@ -425,6 +407,7 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
     curr_size = bit_vec_length
     unknown_positions = {i for i in range(bit_vec_length)}
     sol_vect = ['?' for _ in range(bit_vec_length)]
+    rebuild = REBUILD
     while solver.check() and '?' in sol_vect:
         if DOPRINT:
             print "Starting query #", queryNum
@@ -438,7 +421,10 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
         if sol_vect.count('?') < curr_size: # did we learn some bits?
             curr_size = sol_vect.count('?')
             global K
-            K = int(math.floor(math.log(curr_size, 2)))
+            if ISRANDOM:
+                K = int(curr_size/2)
+            else:
+                K = int(math.floor(math.log(curr_size, 2)))
             # the upper bound on how big the size of the set can be
             # is 2**(bit_vec_length - # of bits known)
             removed = set()
@@ -453,22 +439,17 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
             if curr_size == 0:
                 break
             # compact iterative constraints back into the solver
-            t0 = time.time()
-            if DOPRINT:
-                print("Condensing CNF...")
-            while solver.malleations:
-                res, mall = solver.malleations.pop()
-                AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
-                                                       res, mall, save=False)
-            if DOPRINT:
-                print("Done ({}s)".format(time.time()-t0))
-            t0 = time.time()
-            if DOPRINT:
-                print("Re-extracting CNF")
-            # re-extract CNF now encoding all iterative constraints thus far
-            cnf = solver.cnf()
-            if DOPRINT:
-                print("Done ({}s)".format(time.time()-t0))
+            if rebuild == 0:
+                t0 = time.time()
+                if DOPRINT:
+                    print("Re-extracting CNF")
+                # re-extract CNF now encoding all iterative constraints thus far
+                cnf = solver.cnf()
+                if DOPRINT:
+                    print("Done ({}s)".format(time.time()-t0))
+                rebuild = REBUILD
+            else:
+                rebuild -= 1
         if DOPRINT:
             print "Solver knows ({} bits): {}".format(
                     bit_vec_length-curr_size, ''.join(list(reversed(sol_vect)))
@@ -479,7 +460,7 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
                                                 realM, unknown_positions)
         if DOPRINT:
             print("Done ({}s)".format(time.time()-t0))
-            print("Processing CMS results...") 
+            print("Processing CMS results...")
         t1 = time.time()
         ProcessSizeResults(size_results, finalS, solver, cnfS, cnf,
                            fm, m1_arr, m2_arr, m1c_arr, m2c_arr, realM)
@@ -490,7 +471,7 @@ def Trial(bootstrap=None, log=None, prevcnf=""):
         if DOPRINT:
             print "Elapsed: {}s in query {}".format(elap, queryNum)
             print "Elapsed: {}s so far".format(time.time() - overall_start)
-    
+
     assert finalS.check()
     sol_vect = finalS.knownbits("fm")
     if DOPRINT:
@@ -586,13 +567,14 @@ def InitTrialLogging(realM):
         write_log.write(format_header)
 
 def main():
-    global TESTNAME, LOGNAME, GNU_LOG, BOOTSTRAP, ORACLE, bit_vec_length, format
+    global TESTNAME, LOGNAME, GNU_LOG, BOOTSTRAP, DOPRINT, TMPDIR, DOPRINT
+    global WINDOW_SIZE, NPROCS, ISRANDOM, K, TRIALS, DELTA, REBUILD, INVERT
+    global ORACLE, bit_vec_length, format, REALM_VALID
     try:
         TESTNAME = os.environ["NAME"]
     except KeyError as e:
         print "Must provide NAME in environment for log file name"
         raise e
-    BOOTSTRAP = os.environ.get("PREV")
     LOGNAME = DATE+"/"+TESTNAME
     GNU_LOG = DATE+"/"+TESTNAME
     if not os.path.exists(DATE):
@@ -604,37 +586,57 @@ def main():
         ext += 1
     LOGNAME = DATE+"/"+TESTNAME+('_'+str(ext) if ext > 0 else '')+".log"
     GNU_LOG = DATE+"/"+TESTNAME+('_'+str(ext) if ext > 0 else '')+".dat"
-    if DOPRINT:
-        print("Logging to {}".format(LOGNAME))
-        print("Writing MBound results to {}".format(GNU_LOG))
-
     parser = argparse.ArgumentParser(description="Run format oracle attack")
+    parser.add_argument("--valid", action='store_true')
     parser.add_argument("-f", "--format", type=str, required=True)
-    parser.add_argument("-k", type=int, default=7)
-    parser.add_argument("-t", "--trials", type=int, default=5)
-    parser.add_argument("-d", "--delta", type=float, default=0.3)
-    parser.add_argument("-p", "--procs", type=int, default=64)
-    parser.add_argument("-w", "--window", type=int, default=64)
+    parser.add_argument("-k", type=int, default=0)
+    parser.add_argument("-t", "--trials", type=int, default=2)
+    parser.add_argument("-d", "--delta", type=float, default=0.5)
+    parser.add_argument("-p", "--procs", type=int, default=mp.cpu_count())
+    parser.add_argument("-w", "--window", type=int, default=mp.cpu_count())
+    parser.add_argument("-i", "--invert", action='store_true')
     parser.add_argument("-r", "--random", action='store_true')
     parser.add_argument("-c", "--cnf", type=str, default="")
+    parser.add_argument("--bootstrap", type=str, default="")
+    parser.add_argument("--approxmc", type=str, default="")
+    parser.add_argument("-b", "--rebuild", type=int, default=0)
+    parser.add_argument("-q", "--quiet", action='store_true')
+    parser.add_argument("-x", "--tmp", type=str, default=gettempdir())
     args = vars(parser.parse_args(sys.argv[1:]))
-    global WINDOW_SIZE, NPROCS, ISRANDOM, K, TRIALS, DELTA
     format = importlib.import_module(args["format"])
     try:
         bit_vec_length = format.test_length * format.num_blocks
     except AttributeError:
         bit_vec_length = format.test_length
+    REALM_VALID = args["valid"]
+    BOOTSTRAP = (args["bootstrap"], args["approxmc"])
     ORACLE = oracle.Oracle(format.checkFormat, format.checkFormatSMT, malform)
     WINDOW_SIZE = args["window"]
+    INVERT = args["invert"]
     NPROCS = args["procs"]
     ISRANDOM = args["random"]
-    K = args["k"]
     TRIALS = args["trials"]
     DELTA = args["delta"]
-    prevcnf = args["cnf"]
-    trial_res = Trial(bootstrap=BOOTSTRAP, prevcnf=prevcnf)
-    with open(LOGNAME, "a") as final_res:
-        final_res.write(json.dumps(trial_res))
+    if DELTA != 0.5:
+        raise NotImplementedError("delta must be 0.5")
+    PREVCNF = args["cnf"]
+    REBUILD = args["rebuild"]
+    DOPRINT = not args["quiet"]
+    TMPDIR = args["tmp"]
+    if args['k'] == 0:
+        if ISRANDOM:
+            K = int(bit_vec_length/2)
+        else:
+            K = int(math.floor(math.log(bit_vec_length, 2)))
+    else:
+        K = args["k"]
+    if DOPRINT:
+        print("Logging to {}".format(LOGNAME))
+        print("Writing MBound results to {}".format(GNU_LOG))
+    trial_res = Trial(bootstrap=BOOTSTRAP, prevcnf=PREVCNF)
+    if BOOTSTRAP[1] != "":
+        with open(LOGNAME, "a") as final_res:
+            final_res.write(json.dumps(trial_res))
     return 0
 
 def bootstrapPrevCNF(filename):
@@ -669,40 +671,128 @@ def bootstrapPrevCNF(filename):
             cnf.clauses.append(clause)
     return cnf
 
-def bootstrapPrevRun(filename, finalS, fm, solver, m1_arr, m2_arr):
+def bootstrapQueries(finalS, fm, solver, m1_arr, m2_arr, lines):
+    for line in lines:
+        tokens = line.split(" ")
+        if len(tokens) != 2: # malleation iterable and oracle result boolean
+            continue
+        try:
+            mall = json.loads(tokens[0])
+            res = tokens[1].strip() == "True"
+        except ValueError as e:
+            print("Malformed bootstrap file line: {}".format(line))
+            raise e
+        AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
+                                               res, mall)
+        AddIterativeConstraint_FinalSolver(finalS, fm, res, mall)
+
+def bootstrapAndApproxQueries(q, lines, approxmc_range):
+    counts = {}
+    finalS = libSolver.Z3Solver()
+    fm = finalS.bv('fm', bit_vec_length)
+    if REALM_VALID:
+        finalS.add(format.checkFormatSMT(fm, finalS))
+    for i in range(len(lines)):
+        line = lines[i]
+        tokens = line.split(" ")
+        if len(tokens) != 2: # malleation iterable and oracle result boolean
+            continue
+        try:
+            mall = json.loads(tokens[0])
+            res = tokens[1].strip() == "True"
+        except ValueError as e:
+            print("Malformed bootstrap file line: {}".format(line))
+            raise e
+        if i in approxmc_range:
+            finalS.push()
+            AddIterativeConstraint_FinalSolver(finalS, fm, not res, mall)
+            try:
+                counts[i] = finalS.approxmc(TMPDIR, verbose=True)
+            except Exception as e:
+                counts[i] = (str(e),)
+            finalS.pop()
+        elif i > max(approxmc_range):
+            break
+        AddIterativeConstraint_FinalSolver(finalS, fm, res, mall)
+    q.put(counts)
+
+def bootstrapPrevRun(filename, finalS, fm, solver, m1_arr, m2_arr, approxmc):
     """ Continue a partial attack by extracting realM, malleations, and results
         from a log file
+
+        Or, approxmc count the queries of an attack by extracting the above
+        from a log file, writing results to the file given by the `approxmc'
+        argument
+
+        FIXME eventually make this two functions
     """
     with open(filename) as f:
         lines = f.readlines()
     if DOPRINT:
-        print("Bootstrapping from {} ({} queries)".format(filename, len(lines)-1))
+        print("Bootstrapping from {} ({} queries)".format(filename,
+            len(lines)-(2 if "sawGood" in lines[-1] else 1)
+        ))
     try:
         realM = int((lines[0].split(" "))[6])
     except Exception as e:
-        print("Malformed bootstrap file")
+        print("Malformed bootstrap file (missing realM?)")
         raise e
+    lines = lines[1:]
+    if "sawGood" in lines[-1]:
+        lines = lines[:-1]
     queryNum = 0
-    for line in lines[1:]:
-        tokens = line.split(" ")
-        if len(tokens) != 2: # malleation integer and oracle result
-            continue
-        try:
-            mall = json.loads(tokens[0])
-            res = True if tokens[1].strip() == "True" else False
-        except ValueError as e:
-            print("Malformed bootstrap file")
-            raise e
-        # NOTE only taking "True" oracle queries from log file
-        # This represents a hack which makes PKCS7 (and possibly many formats)
-        # much faster to bootstrap at minimal loss
-        #if res:
-        if res:
-            queryNum += 1
-            AddIterativeConstraint_IterativeSolver(solver, m1_arr, m2_arr,
-                                                   res, mall)
-            AddIterativeConstraint_FinalSolver(finalS, fm, res, mall)
-    return queryNum, realM
+    if approxmc != "":
+        full_range = [x for x in range(len(lines))]
+        q = mp.Queue()
+        procs = []
+        ranges = []
+        counts = {}
+        range_len = int(math.ceil(float(len(lines))/NPROCS))
+        for i in range(NPROCS):
+            _range = full_range[i*range_len:(i+1)*range_len]
+            if _range:
+                ranges.append(_range)
+        assert len(ranges) <= NPROCS
+        for i in full_range:
+            if not any(map(lambda x: i in x, ranges)):
+                raise ValueError("Missing {} in ranges".format(i))
+        for r in ranges:
+            p = mp.Process(target=bootstrapAndApproxQueries,
+                           args=(q, lines, r))
+            p.daemon = True
+            p.start()
+            procs.append(p)
+        while len(counts) < len(full_range):
+            new = q.get()
+            counts.update(new)
+            with open(approxmc, 'a') as f:
+                for query in new:
+                    if len(new[query]) == 2:
+                        count, time = new[query]
+                        f.write("{}\n".format(json.dumps(
+                            {'query': query, 'count': count,
+                             'time': time}))
+                        )
+                    else:
+                        f.write("{}\n".format(json.dump(
+                            {'query':query, 'error': new[query]}))
+                        )
+        for p in procs:
+            p.join()
+        with open(approxmc + '_final', 'w') as f:
+            for i in range(len(lines)):
+                if len(counts[i]) == 2:
+                    f.write("{}\n".format(json.dumps(
+                        {'query': i, 'count': counts[i][0],
+                         'time': counts[i][1]}))
+                    )
+                else:
+                    f.write("{}\n".format(json.dump(
+                        {'query':i, 'error': counts[i][0]}))
+                    )
+    else:
+        bootstrapQueries(finalS, fm, solver, m1_arr, m2_arr, lines)
+    return len(lines), realM
 
 if __name__ == "__main__":
     exit(main())
