@@ -1,5 +1,4 @@
-import CRC32 as crc
-# L32 currently should be L16 (its only a 16 bit message)
+import CRC as crc
 import L16Bit as toy_format
 
 max_msg_size = crc.CRC_SIZE + toy_format.test_length
