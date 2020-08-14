@@ -1,19 +1,21 @@
 import z3 # I know this is cheating
 import random
-from math import log, floor
+from math import log, floor, ceil
 from itertools import permutations
 
-GRID_WIDTH = 2
-GRID_HEIGHT = 2
+GRID_WIDTH = 3
+GRID_HEIGHT = 3
 
 UNFILLED = 0
 word_size = int(floor(log(GRID_WIDTH*GRID_HEIGHT, 2)))+1
 square_size = GRID_WIDTH*GRID_HEIGHT*word_size
 grid_size = GRID_WIDTH*GRID_HEIGHT*square_size
 test_length = grid_size
+hasIV = False
+isStateful = False
 
 pack_line = lambda s: reduce(lambda a, b: (a << word_size)|b, s, 0)
-perms = [pack_line(p) for p in permutations(range(1,GRID_WIDTH*GRID_HEIGHT+1))]
+PERMS = [pack_line(p) for p in permutations(range(1,GRID_WIDTH*GRID_HEIGHT+1))]
 
 class Puzzle:
     def __init__(self):
@@ -30,6 +32,18 @@ class Puzzle:
                 grid_row.append(square)
             grid.append(grid_row)
         self.grid = grid
+
+    def pretty(self):
+        rows = ["" for _ in range(GRID_HEIGHT*GRID_HEIGHT)]
+        for i in range(len(self.grid)):
+            grid_row = self.grid[i]
+            for square in grid_row:
+                for j in range(len(square)):
+                    row = square[j]
+                    for value in row:
+                        s = str(value) if value > 0 else " "
+                        rows[GRID_HEIGHT*i + j] += "{} ".format(s)
+        return "\n".join(rows)
 
     def pack(self):
         v = 0
@@ -76,39 +90,39 @@ class Puzzle:
                 return False
         return True
 
-"""
-grid = [
-        [[[4,9,7],
-          [2,6,3],
-          [1,5,8]], [[1,6,5],
-                     [8,4,9],
-                     [7,2,3]], [[3,2,8],
-                                [5,1,7],
-                                [4,6,9]]],
-        [[[5,1,2],
-          [9,8,6],
-          [7,3,4]], [[4,8,7],
-                     [3,5,2],
-                     [9,1,6]], [[6,9,3],
-                                [1,7,4],
-                                [8,5,2]]],
-        [[[8,7,9],
-          [6,4,1],
-          [3,2,5]], [[5,3,1],
-                     [2,9,8],
-                     [6,7,4]], [[2,4,6],
-                                [7,3,5],
-                                [9,8,1]]],
-]
-"""
-grid = [
-        [[[1,4],
-          [3,2]], [[2,3],
-                   [4,1]]],
-        [[[4,1],
-          [2,3]], [[3,2],
-                   [1,4]]],
-]
+if GRID_WIDTH*GRID_HEIGHT == 9:
+    grid = [
+            [[[4,9,7],
+              [2,6,3],
+              [1,5,8]], [[1,6,5],
+                         [8,4,9],
+                         [7,2,3]], [[3,2,8],
+                                    [5,1,7],
+                                    [4,6,9]]],
+            [[[5,1,2],
+              [9,8,6],
+              [7,3,4]], [[4,8,7],
+                         [3,5,2],
+                         [9,1,6]], [[6,9,3],
+                                    [1,7,4],
+                                    [8,5,2]]],
+            [[[8,7,9],
+              [6,4,1],
+              [3,2,5]], [[5,3,1],
+                         [2,9,8],
+                         [6,7,4]], [[2,4,6],
+                                    [7,3,5],
+                                    [9,8,1]]],
+    ]
+elif GRID_WIDTH*GRID_HEIGHT == 4:
+    grid = [
+            [[[1,4],
+              [3,2]], [[2,3],
+                       [4,1]]],
+            [[[4,1],
+              [2,3]], [[3,2],
+                       [1,4]]],
+    ]
 solved = Puzzle()
 from copy import deepcopy
 solved.grid = deepcopy(grid)
@@ -120,14 +134,18 @@ assert solved.check()
 def checkFormat(v):
     puzzle = Puzzle()
     puzzle.unpack(v)
-    return puzzle.check()
+    return 1 if puzzle.check() else 0
 
-def is_perm(solver, v):
-    is_any = solver.false()
-    # TODO try an or tree instead of flat
-    for p in perms:
-        is_any = solver._or(is_any, solver._eq(v, p))
-    return is_any
+def is_perm(solver, v, perms):
+    if len(perms) > 1:
+        left = perms[:int(ceil(len(perms)/2))]
+        right = perms[int(ceil(len(perms)/2)):]
+        return solver._or(is_perm(solver,v,left),
+                          is_perm(solver,v,right))
+    elif len(perms) == 1:
+        return solver._eq(v, perms[0])
+    else:
+        return solver.false()
 
 def get_val(solver, v, i):
     #return (v >> (word_size*(81-i+1))) & ((1 << word_size)-1)
@@ -162,17 +180,15 @@ def checkFormatSMT(v, solver):
     is_valid = solver.true()
     for i in range(GRID_WIDTH*GRID_HEIGHT):
         is_valid = solver._and(is_valid,
-                               is_perm(solver, extract_row(solver, v, i)))
+                               is_perm(solver, extract_row(solver, v, i), PERMS))
         is_valid = solver._and(is_valid,
-                               is_perm(solver, extract_col(solver, v, i)))
+                               is_perm(solver, extract_col(solver, v, i), PERMS))
         is_valid = solver._and(is_valid,
-                               is_perm(solver, extract_sq(solver, v, i)))
-    return is_valid
+                               is_perm(solver, extract_sq(solver, v, i), PERMS))
+    return solver._if(is_valid, solver.bvconst(1,2), solver.bvconst(0,2))
 
 def makePaddedMessage():
     return solved.pack()
 
 if __name__ == '__main__':
     puzzle = Puzzle()
-    puzzle.unpack(solved.pack() ^ 190153347076096)
-    print(puzzle.grid)

@@ -4,6 +4,8 @@ from math import floor, log
 test_length = 36
 size_field = 5
 message_field = test_length-size_field
+isStateful = False
+hasIV = False 
 
 def truncate(m, p):
     return m ^ (p & ((1 << size_field)-1))
@@ -16,7 +18,7 @@ def checkFormat(m):
     while v != 0:
         p ^= (v & 1)
         v >>= 1
-    return p == 1
+    return 1 if p == 1 else 0
 
 def checkFormatSMT(m, solver):
     p = solver.false()
@@ -28,8 +30,8 @@ def checkFormatSMT(m, solver):
                 solver._ult(solver.bvconst(i-size_field, size_field), size),
                 solver._xor(parity, bit),
                 parity)
-    return solver._and(solver._ugt(size, solver.bvconst(0, size_field)),
-                       solver._eq(parity, solver.bvconst(1, 1)))
+    return solver._if(solver._and(solver._ugt(size, solver.bvconst(0, size_field)),
+                       solver._eq(parity, solver.bvconst(1, 1))), solver.bvconst(1,2), solver.bvconst(0,2))
 
 def makePaddedMessage():
     v = random.randint(0, 2**message_field - 1)

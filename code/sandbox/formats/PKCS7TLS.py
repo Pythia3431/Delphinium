@@ -3,11 +3,13 @@ from math import ceil
 ##### ALL GLOBAL CONSTANTS #######
 unit_size = 8
 block_size = 16
-test_length = block_size * unit_size
-num_blocks = 2
-max_msg_size = test_length * num_blocks
+block_length = block_size * unit_size
+num_blocks = 3
+max_msg_size = block_length * num_blocks
 length_field_size = max_msg_size.bit_length()
-bit_vec_length = max_msg_size + length_field_size
+test_length = max_msg_size + length_field_size
+hasIV = True
+isStateful = False
 
 def checkFormat(padded_msg_with_mask):
     if type(padded_msg_with_mask) is list or type(padded_msg_with_mask) is tuple:
@@ -16,15 +18,15 @@ def checkFormat(padded_msg_with_mask):
     else:
         padded_and_field_msg = padded_msg_with_mask
         mask = 0
-    if mask & ((1 << test_length)-1) != 0:
+    if mask & ((1 << block_length)-1) != 0:
         return 2
  
     # length of message  needs to be a multiple of the block size
     length = padded_and_field_msg & ((1 << length_field_size) - 1)
-    if (padded_and_field_msg & ((1 << length_field_size) - 1)) % test_length != 0:
+    if (padded_and_field_msg & ((1 << length_field_size) - 1)) % block_length != 0:
         return 0
     # this check is needed for the IV block --- we can't submit a query without at least two blocks. an error that occurs because of this is not format related but an error in the cryptographic software 
-    if length <= test_length:
+    if length <= block_length:
         return 2
 
     # message cannot be more than the professed length
@@ -58,21 +60,21 @@ def checkFormatSMT(padded_msg_with_mask, solver):
     length_mask = (1 << length_field_size)-1
     # length must be multiple of the block size in bits
     length = padded_and_field_msg & length_mask
-    length_check = solver._eq(solver._mod(length, test_length), 0)
+    length_check = solver._eq(solver._mod(length, block_length), 0)
     
     # length must be larger than one block because queries need an IV 
-    iv_block_check = solver._and(length_check, solver._ugt(length, test_length))
+    iv_block_check = solver._and(length_check, solver._ugt(length, block_length))
 
     # message must be smaller than the length field
     message_bits = solver._rshift(padded_and_field_msg, length_field_size)
     length_check = solver._and(length_check, solver._ule(message_bits, (1 << length)-1))
     length_check = solver._and(length_check, solver._ule(length, max_msg_size))
     # check for touching bits
-    maul_check = mask & ((1 << test_length)-1)
+    maul_check = mask & ((1 << block_length)-1)
     maul_check = solver._not(solver._eq(maul_check, 0))
  
     # TLS PKCS7 paddng check
-    padded_msg = solver.extract(padded_and_field_msg, (num_blocks*test_length) + length_field_size - 1, length_field_size)
+    padded_msg = solver.extract(padded_and_field_msg, (num_blocks*block_length) + length_field_size - 1, length_field_size)
     for i in range(0, block_size):
         correct_pad = solver.true()
         for num in range(i+1):
@@ -108,14 +110,15 @@ def makePaddedMessage(padding_length=None):
 
     # add the beginning blocks
     add_blocks = random.randint(0, num_blocks-2)
+    print("Number of added blocks is {}".format(add_blocks))
     if num_blocks -2 < 0:
         raise ValueError("Number of blocks must at least be large enough for the IV and padding block")
     for i in range(add_blocks):
-        adding_block = random.randint(0, 2**(test_length))
-        expand_str_chr = expand_str_chr | (adding_block << (test_length * (1 + i)))
+        adding_block = random.randint(0, 2**(block_length))
+        expand_str_chr = expand_str_chr | (adding_block << (block_length * (1 + i)))
 
     # add the IV last
-    iv_block = random.randint(2**(test_length-1), (2**(test_length))-1)
-    expand_str_chr = expand_str_chr | (iv_block << (test_length * (add_blocks + 1)))
+    iv_block = random.randint(2**(block_length-1), (2**(block_length))-1)
+    expand_str_chr = expand_str_chr | (iv_block << (block_length * (add_blocks + 1)))
     # add the length field size to the beginning
-    return (expand_str_chr << length_field_size) | ((add_blocks + 2) * test_length)
+    return (expand_str_chr << length_field_size) | ((add_blocks + 2) * block_length)

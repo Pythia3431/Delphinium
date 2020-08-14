@@ -6,10 +6,12 @@ POLYNOMIAL_NO_LEADING = 0x1D #0x4C11DB7 #0x3 #0x8005#0x3#0x5#0x1D #0x4C11DB7
 CRC_SIZE = 8 #32 # 4
 INPUT_SIZE = 8 if (CRC_SIZE % 8 == 0) else CRC_SIZE
 INITIAL_VALUE = (1 << CRC_SIZE)-1
-test_length = 24 #this must be changed when being used in conjunction with another format
 FINAL_VALUE = (1 << CRC_SIZE)-1 
-length_field_size = int(math.log(test_length + CRC_SIZE,2)) + 1
-bit_vec_length = test_length + CRC_SIZE + length_field_size
+plain_input = INPUT_SIZE*4
+length_field_size = int(math.log(plain_input+CRC_SIZE,2)) + 1
+test_length = plain_input + CRC_SIZE + length_field_size
+hasIV = False
+isStateful = False
 """ Validly formatted message looks like the following:
     [n bit message field] | [ x bit CRC field ] | [total_msg_length bit field]
     the total_msg_length field is always equal to n (the number of bits in the message)
@@ -53,7 +55,7 @@ def checkFormat(msg):
     # extract first n bits
     msg_length = (msg & ((1 << length_field_size)-1)) - CRC_SIZE
 
-    msg_length_input = (test_length + (INPUT_SIZE - 1)) // INPUT_SIZE
+    msg_length_input = (plain_input + (INPUT_SIZE - 1)) // INPUT_SIZE
 
     msg = msg >> length_field_size
     crc_value_from_msg = msg & ((1 << CRC_SIZE)-1)
@@ -89,7 +91,7 @@ def checkFormatSMT(full_msg, solver):
     actual_msg = solver.extract(msg, msg.size()-1, CRC_SIZE)
     crc_check = solver.extract(msg, CRC_SIZE-1,0)
     
-    l = (test_length + (INPUT_SIZE - 1)) // INPUT_SIZE
+    l = (plain_input + (INPUT_SIZE - 1)) // INPUT_SIZE
     or_sum = solver.false()
     for i in range(1,l + 1): 
         accumulator = calculateCRCSymbolic(actual_msg, i, solver)
@@ -101,7 +103,7 @@ def makePaddedMessage():
         a crc checksum and a field that expresses the length
        of the message + the checksum 
     """
-    number_bytes = random.randint(1, test_length // INPUT_SIZE)
+    number_bytes = random.randint(1, plain_input // INPUT_SIZE)
     random_msg = random.randint(0,(2**(number_bytes*INPUT_SIZE))-1)
     random_crc = calculateCRCNormal(random_msg, number_bytes)
     

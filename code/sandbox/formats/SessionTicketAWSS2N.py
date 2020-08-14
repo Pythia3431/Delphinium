@@ -28,13 +28,16 @@ PROTO_VERSIONS = [TLS12_PROTOCOL_VERS, UNKNOWN_VERS]
 TIME_FIELD = 8 #(field in bytes)
 # this value differs based on connection but it is mostly standard
 TICKET_LIFETIME =  54000000000000
-TLS_SECRET_SIZE = 48 #(field in bytes)  
+TLS_SECRET_SIZE = 48 #(field in bytes) before, I had this value equal to 4 to fit in one block  
 
 S2N_STATE_SIZE_IN_BYTES = TLS_SECRET_SIZE + 12
-test_length = S2N_STATE_SIZE_IN_BYTES * 8
-max_msg_size = test_length
-length_field_size = test_length.bit_length()
-bit_vec_length = test_length + length_field_size 
+size_of_ticket = S2N_STATE_SIZE_IN_BYTES * 8
+max_msg_size = size_of_ticket
+length_field_size = size_of_ticket.bit_length()
+block_length = 128
+test_length = size_of_ticket + length_field_size 
+hasIV = False
+isStateful = True
 
 BYTE_MASK = (1<<8)-1
 
@@ -89,7 +92,8 @@ def grabSymbolicByte(msg, byte_idx, solver):
 def grabNSymbolicBytes(msg, num_bytes, byte_idx, solver):
     return solver._rshift(msg, 8*byte_idx) & ((1 << (8 * num_bytes))-1)
 
-# code assumption for message is that the "beginning" of the message starts at the 0 index
+# code assumption for message is that the "beginning" of the message starts at the 0
+# index
 def checkFormat(full_msg, time, state):
     #  message must be S2N_STATE_SIZE_IN_BYTES bytes long
     if full_msg & ((1 << length_field_size)-1) != test_length:

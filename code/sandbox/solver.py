@@ -1,6 +1,11 @@
 import z3
 import copy
-import stp
+hasSTP = True
+try:
+    import stp
+except ImportError:
+    print("Notice: Missing STP library, can only use Z3 backend")
+    hasSTP
 import subprocess
 import time
 from tempfile import NamedTemporaryFile, gettempdir
@@ -253,8 +258,14 @@ class SolverInterface:
                                      trials_passed)
         return self._uge(trials_passed, self.bvconst(int(((0.5+delta)*t)), t))
 
-    def approxmc(self, tmpdir=gettempdir(), verbose=False):
+    def approxmc(self, tmpdir=gettempdir(), verbose=False, writeback=None):
         """ approxmc count the current solver """
+        if writeback:
+            with open(writeback, "w") as file_wb:
+                write_out = str(self.cnf(addTrue=False))
+                file_wb.write(write_out)
+                return
+
         with NamedTemporaryFile(mode='w+', dir=tmpdir) as f:
             if verbose:
                 print("Generating CNF...")
@@ -269,7 +280,7 @@ class SolverInterface:
             if verbose:
                 print("Running ApproxMC...")
             try:
-                output = subprocess.check_output(['approxmc', f.name])
+                output = subprocess.check_output(['approxmc', f.name, "--th", "32"])
             except subprocess.CalledProcessError as e:
                 if "UNSAT" in e.output:
                     with open("approxmc_error", 'w') as g:
@@ -296,7 +307,7 @@ class SolverInterface:
     def cnf(self):
         raise NotImplementedError
 
-    def exact(self, name, printModel=False):
+    def exact(self, name, printModel=True):
         """ exact count the current solver on the named bitvec """
         self.push()
         count = 0
@@ -342,6 +353,9 @@ class Z3Solver(SolverInterface):
 
     def add(self, *constraints):
         self.solver.add(*constraints)
+
+    def add_debug(self, constraint, name):
+        self.solver.assert_and_track(constraint, name)
 
     def bv(self, name, length=0):
         if name in self.bitvecs:
@@ -443,6 +457,7 @@ class Z3Solver(SolverInterface):
     def cnf(self, addTrue=True):
         goal = z3.Goal()
         goal.add(self.solver.assertions())
+        # take out propagate values after simplify
         tactic = z3.Then('simplify', 'propagate-values', 'bit-blast', 'tseitin-cnf')
         subgoal = tactic(goal)
         cnf = CNF()
@@ -469,7 +484,6 @@ class Z3Solver(SolverInterface):
             cnf.clauses.append([str(true)])
         # needs to be one greater because vars is one ahead of the current number of variables 
         cnf.var = number_vars + 1
-
         return cnf
 
     def extract(self, bv, high, low):
@@ -481,99 +495,100 @@ class Z3Solver(SolverInterface):
     def extend(self, bv, n_zeroes):
         return z3.ZeroExt(n_zeroes,bv)
 
-class STPSolver(SolverInterface):
-    def __init__(self):
-        self.solver = stp.Solver()
-        self.solver.useCryptominisat()
-        if not self.solver.isUsingCryptominisat():
-            print("Solver not using cryptominisat")
-        self.bitvecs = {}
-        self.knownbitscache = {}
+if hasSTP:
+    class STPSolver(SolverInterface):
+        def __init__(self):
+            self.solver = stp.Solver()
+            self.solver.useCryptominisat()
+            if not self.solver.isUsingCryptominisat():
+                print("Solver not using cryptominisat")
+            self.bitvecs = {}
+            self.knownbitscache = {}
 
-    def check(self):
-        return self.solver.check()
+        def check(self):
+            return self.solver.check()
 
-    def add(self, *constraints):
-        self.solver.add(*constraints)
+        def add(self, *constraints):
+            self.solver.add(*constraints)
 
-    def bv(self, name, length=0):
-        if name in self.bitvecs:
-            return self.bitvecs[name][0]
-        else:
-            if length == 0:
-                raise ValueError("New bitvecs must specify length")
-            self.bitvecs[name] = (self.solver.bitvec(name, length), length)
-            return self.bitvecs[name][0]
+        def bv(self, name, length=0):
+            if name in self.bitvecs:
+                return self.bitvecs[name][0]
+            else:
+                if length == 0:
+                    raise ValueError("New bitvecs must specify length")
+                self.bitvecs[name] = (self.solver.bitvec(name, length), length)
+                return self.bitvecs[name][0]
 
-    def true(self):
-        return self.solver.true()
+        def true(self):
+            return self.solver.true()
 
-    def false(self):
-        return self.solver.false()
+        def false(self):
+            return self.solver.false()
 
-    def bvconst(self, value, length):
-        return self.solver.bitvecval(length, value)
+        def bvconst(self, value, length):
+            return self.solver.bitvecval(length, value)
 
-    def _and(self, bv1, bv2):
-        return self.solver.and_(bv1, bv2)
+        def _and(self, bv1, bv2):
+            return self.solver.and_(bv1, bv2)
 
-    def _or(self, bv1, bv2):
-        return self.solver.or_(bv1, bv2)
+        def _or(self, bv1, bv2):
+            return self.solver.or_(bv1, bv2)
 
-    def _xor(self, bv1, bv2):
-        return bv1 ^ bv2
+        def _xor(self, bv1, bv2):
+            return bv1 ^ bv2
 
-    def _eq(self, bv1, bv2):
-        return bv1 == bv2
+        def _eq(self, bv1, bv2):
+            return bv1 == bv2
 
-    def _iff(self, b1, b2):
-        return self.solver.iff(b1, b2)
+        def _iff(self, b1, b2):
+            return self.solver.iff(b1, b2)
 
-    def _not(self, bv):
-        return self.solver.not_(bv)
+        def _not(self, bv):
+            return self.solver.not_(bv)
 
-    def _if(self, cond, then, els):
-        return self.solver.ite(cond, then, els)
+        def _if(self, cond, then, els):
+            return self.solver.ite(cond, then, els)
 
-    def _lshift(self, bv, i):
-        return (bv << i)
+        def _lshift(self, bv, i):
+            return (bv << i)
 
-    def _rshift(self, bv, i):
-        return (bv >> i)
+        def _rshift(self, bv, i):
+            return (bv >> i)
 
-    def _mult(self, bv1, bv2):
-        return (bv1 * bv2)
+        def _mult(self, bv1, bv2):
+            return (bv1 * bv2)
 
-    def _mod(self, bv, mod):
-        return (bv % mod)
+        def _mod(self, bv, mod):
+            return (bv % mod)
 
-    def _ule(self, bv1, bv2):
-        return (bv1 <= bv2)
+        def _ule(self, bv1, bv2):
+            return (bv1 <= bv2)
 
-    def _uge(self, bv1, bv2):
-        return (bv1 >= bv2)
+        def _uge(self, bv1, bv2):
+            return (bv1 >= bv2)
 
-    def _ult(self, bv1, bv2):
-        return (bv1 < bv2)
+        def _ult(self, bv1, bv2):
+            return (bv1 < bv2)
 
-    def _ugt(self, bv1, bv2):
-        return (bv1 > bv2)
+        def _ugt(self, bv1, bv2):
+            return (bv1 > bv2)
 
-    def push(self):
-        self.solver.push()
+        def push(self):
+            self.solver.push()
 
-    def pop(self):
-        self.solver.pop()
+        def pop(self):
+            self.solver.pop()
 
-    def model(self, *names):
-        m = self.solver.model()
-        result = {}
-        for n in names:
-            result[n] = m[n]
-        return result
+        def model(self, *names):
+            m = self.solver.model()
+            result = {}
+            for n in names:
+                result[n] = m[n]
+            return result
 
-    def bvlen(self, name):
-        return self.bitvecs[name][1]
+        def bvlen(self, name):
+            return self.bitvecs[name][1]
 
-    def extract(self, bv, high, low):
-        return bv.extract(high, low)
+        def extract(self, bv, high, low):
+            return bv.extract(high, low)

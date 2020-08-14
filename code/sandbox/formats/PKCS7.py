@@ -2,9 +2,11 @@ import random
 from math import log, floor
 ##### ALL GLOBAL CONSTANTS #######
 unit_size = 8
-block_size = 16
+block_size = 3
+
 test_length = block_size * unit_size
-num_blocks = 1
+hasIV = False
+isStateful = False
 
 def checkFormat(padded_msg):
     compound_expr = False
