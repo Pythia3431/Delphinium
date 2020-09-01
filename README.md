@@ -33,7 +33,11 @@ In order to use Delphinium to attack a format oracle, the following is required:
   `TLSCBC_For_Network_Test/tls_cbc.py` to replace calls to the example predicate
   oracle provided in `oracle.py`
   
-Then, to run, `python trimmed_test.py`. Arguments:
+Then, to run, `NAME=experiment_name python trimmed_test.py`.
+
+`experiment_name` determines where log files are saved and should be unique and human-readable, e.g. `PCKS7_128bits`
+
+Arguments:
 
 Required Arguments:
 * `-f --format`: Select which format file to use. e.g. `formats.PKCS7`
